@@ -15,7 +15,6 @@
 package client
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -72,11 +71,11 @@ func newConnPool(maxSize uint, addr string, ver uint64, security config.Security
 	return a, nil
 }
 
-func (a *connPool) monitoredDial(ctx context.Context, connName, target string, opts ...grpc.DialOption) (conn *monitoredConn, err error) {
+func (a *connPool) monitoredDial(connName, target string, opts ...grpc.DialOption) (conn *monitoredConn, err error) {
 	conn = &monitoredConn{
 		Name: connName,
 	}
-	conn.ClientConn, err = grpc.DialContext(ctx, target, opts...)
+	conn.ClientConn, err = grpc.NewClient(target, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +112,6 @@ func (a *connPool) Init(addr string, security config.Security, idleNotify *uint3
 	}
 	keepAlive := cfg.TiKVClient.GrpcKeepAliveTime
 	for i := range a.conns {
-		ctx, cancel := context.WithTimeout(context.Background(), a.dialTimeout)
 		var callOptions []grpc.CallOption
 		callOptions = append(callOptions, grpc.MaxCallRecvMsgSize(MaxRecvMsgSize))
 		if cfg.TiKVClient.GrpcCompressionType == gzip.Name {
@@ -145,13 +143,11 @@ func (a *connPool) Init(addr string, security config.Security, idleNotify *uint3
 			opts = append(opts, experimental.WithRecvBufferPool(grpc.NewSharedBufferPool()))
 		}
 		conn, err := a.monitoredDial(
-			ctx,
 			fmt.Sprintf("%s-%d", a.target, i),
 			addr,
 			opts...,
 		)
 
-		cancel()
 		if err != nil {
 			// Cleanup if the initialization fails.
 			a.Close()
