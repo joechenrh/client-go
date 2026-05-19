@@ -74,6 +74,8 @@ var (
 	TiKVBatchMoreRequests                          *prometheus.SummaryVec
 	TiKVBatchWaitOverLoad                          prometheus.Counter
 	TiKVBatchPendingRequests                       *prometheus.HistogramVec
+	TiKVBatchResponseSize                          prometheus.Histogram
+	TiKVBatchResponsePickupLatency                 prometheus.Histogram
 	TiKVBatchRequests                              *prometheus.HistogramVec
 	TiKVBatchRequestDuration                       *prometheus.SummaryVec
 	TiKVBatchClientUnavailable                     prometheus.Histogram
@@ -461,6 +463,26 @@ func initMetrics(namespace, subsystem string, constLabels prometheus.Labels) {
 			Help:        "number of requests pending in the batch channel",
 			ConstLabels: constLabels,
 		}, []string{LblTarget})
+
+	TiKVBatchResponseSize = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace:   namespace,
+			Subsystem:   subsystem,
+			Name:        "batch_response_size_bytes",
+			Buckets:     prometheus.ExponentialBuckets(1024, 4, 12), // 1 KB ~ 4 GB
+			Help:        "Protobuf size of BatchCommands responses delivered to the receive loop.",
+			ConstLabels: constLabels,
+		})
+
+	TiKVBatchResponsePickupLatency = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace:   namespace,
+			Subsystem:   subsystem,
+			Name:        "batch_response_pickup_latency_seconds",
+			Buckets:     prometheus.ExponentialBuckets(0.0001, 4, 11), // 0.1 ms ~ 100 s
+			Help:        "Time between batchRecvLoop delivering a response to entry.res and the requester picking it up.",
+			ConstLabels: constLabels,
+		})
 
 	TiKVBatchRequests = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -1030,6 +1052,8 @@ func RegisterMetrics() {
 	prometheus.MustRegister(TiKVBatchMoreRequests)
 	prometheus.MustRegister(TiKVBatchWaitOverLoad)
 	prometheus.MustRegister(TiKVBatchPendingRequests)
+	prometheus.MustRegister(TiKVBatchResponseSize)
+	prometheus.MustRegister(TiKVBatchResponsePickupLatency)
 	prometheus.MustRegister(TiKVBatchRequests)
 	prometheus.MustRegister(TiKVBatchRequestDuration)
 	prometheus.MustRegister(TiKVBatchClientUnavailable)

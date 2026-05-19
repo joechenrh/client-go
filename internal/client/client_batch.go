@@ -70,6 +70,42 @@ var globalEncodedMsgDataPool = mem.NewTieredBufferPool(
 	256, 4<<10, 16<<10, 32<<10, 1<<20, // copied from defaultBufferPoolSizes
 )
 
+// [obs] Global counters: responses dispatched to entry.res but not yet picked up
+// by the requester goroutine. inflightRespBytes is the cumulative protobuf size
+// of those parked responses; this is the candidate for the multi-schema grpc/mem
+// pile-up we see in heap profiles.
+var (
+	inflightRespCount atomic.Int64
+	inflightRespBytes atomic.Int64
+	// batchCmdsInflightLogLastNS is the unix-nano timestamp of the last
+	// [obs] batchCmds inflight log line; we rate-limit to at most one log
+	// every batchCmdsInflightLogInterval across all batchRecvLoop goroutines.
+	batchCmdsInflightLogLastNS atomic.Int64
+)
+
+const batchCmdsInflightLogInterval = 15 * time.Second
+
+func init() {
+	prometheus.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace: "tikv",
+			Subsystem: "client_go",
+			Name:      "batch_inflight_resp_count",
+			Help:      "BatchCommands responses delivered into entry.res but not yet picked up by the requester goroutine.",
+		},
+		func() float64 { return float64(inflightRespCount.Load()) },
+	))
+	prometheus.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace: "tikv",
+			Subsystem: "client_go",
+			Name:      "batch_inflight_resp_bytes",
+			Help:      "Cumulative protobuf size of BatchCommands responses parked in entry.res awaiting pickup.",
+		},
+		func() float64 { return float64(inflightRespBytes.Load()) },
+	))
+}
+
 type encodedBatchCmd struct {
 	// implement isBatchCommandsRequest_Request_Cmd
 	tikvpb.BatchCommandsRequest_Request_Empty
@@ -157,6 +193,11 @@ type batchCommandsEntry struct {
 	start   time.Time
 	sendLat int64
 	recvLat int64
+
+	// [obs] Protobuf size of the response parked in res, set by response() and
+	// read by the requester at pickup. Used to subtract from inflightRespBytes.
+	respSize        int64
+	respDeliveredAt int64 // unix nanos
 }
 
 func (b *batchCommandsEntry) isCanceled() bool {
@@ -174,9 +215,17 @@ func (b *batchCommandsEntry) async() bool {
 func (b *batchCommandsEntry) response(resp *tikvpb.BatchCommandsResponse_Response) {
 	if b.async() {
 		b.cb.Schedule(tikvrpc.FromBatchCommandsResponse(resp))
-	} else {
-		b.res <- resp
+		return
 	}
+	// [obs] Track response sitting in entry.res waiting for pickup. The
+	// pairing decrement happens in sendBatchRequest where <-entry.res is read.
+	size := int64(resp.Size())
+	atomic.StoreInt64(&b.respSize, size)
+	atomic.StoreInt64(&b.respDeliveredAt, time.Now().UnixNano())
+	inflightRespCount.Add(1)
+	inflightRespBytes.Add(size)
+	metrics.TiKVBatchResponseSize.Observe(float64(size))
+	b.res <- resp
 }
 
 func (b *batchCommandsEntry) error(err error) {
@@ -806,6 +855,23 @@ func (c *batchCommandsClient) batchRecvLoop(cfg config.TiKVClient, tikvTransport
 			atomic.StoreUint64(tikvTransportLayerLoad, transportLayerLoad)
 		}
 		connMetrics.recvLoopProcessDur.Observe(time.Since(recvLoopStartTime).Seconds())
+
+		// [obs] Rate-limited log: at most one [obs] batchCmds inflight line
+		// every batchCmdsInflightLogInterval, across all batchRecvLoop goroutines.
+		// Gives a time-based, grep-able trail to correlate with grpc/mem heap.
+		if inflight := inflightRespCount.Load(); inflight > 0 {
+			nowNS := time.Now().UnixNano()
+			last := batchCmdsInflightLogLastNS.Load()
+			if nowNS-last >= int64(batchCmdsInflightLogInterval) &&
+				batchCmdsInflightLogLastNS.CompareAndSwap(last, nowNS) {
+				logutil.BgLogger().Info("[obs] batchCmds inflight",
+					zap.String("target", c.target),
+					zap.Int64("c_sent", c.sent.Load()),
+					zap.Int64("inflight_resp_count", inflight),
+					zap.Int64("inflight_resp_mb", inflightRespBytes.Load()/1024/1024),
+					zap.Int64("max_concurrency_limit", c.maxConcurrencyRequestLimit.Load()))
+			}
+		}
 	}
 }
 
@@ -936,6 +1002,16 @@ func sendBatchRequest(
 			metrics.BatchRequestDurationRecv.Observe(time.Duration(recvLat).Seconds())
 		}
 		metrics.BatchRequestDurationDone.Observe(time.Since(entry.start).Seconds())
+		// [obs] Pair-decrement for the case where response() incremented inflight
+		// but the requester exited via the cancel/timeout branch and skipped the
+		// pickup-side decrement. CAS to 0 makes this idempotent with the success
+		// branch.
+		if size := atomic.LoadInt64(&entry.respSize); size > 0 {
+			if atomic.CompareAndSwapInt64(&entry.respSize, size, 0) {
+				inflightRespCount.Add(-1)
+				inflightRespBytes.Add(-size)
+			}
+		}
 	}()
 
 	select {
@@ -955,6 +1031,22 @@ func sendBatchRequest(
 	case res, ok := <-entry.res:
 		if !ok {
 			return nil, errors.WithStack(entry.err)
+		}
+		// [obs] CAS so the defer-side pair-decrement is idempotent with this branch.
+		if size := atomic.LoadInt64(&entry.respSize); size > 0 &&
+			atomic.CompareAndSwapInt64(&entry.respSize, size, 0) {
+			inflightRespCount.Add(-1)
+			inflightRespBytes.Add(-size)
+			if delivered := atomic.LoadInt64(&entry.respDeliveredAt); delivered > 0 {
+				elapsed := time.Since(time.Unix(0, delivered))
+				metrics.TiKVBatchResponsePickupLatency.Observe(elapsed.Seconds())
+				if elapsed >= 200*time.Millisecond {
+					logutil.BgLogger().Info("[obs] batchCmds response pickup slow",
+						zap.Duration("elapsed", elapsed),
+						zap.Int64("resp_size", size),
+						zap.String("addr", addr))
+				}
+			}
 		}
 		return tikvrpc.FromBatchCommandsResponse(res)
 	case <-ctx.Done():
